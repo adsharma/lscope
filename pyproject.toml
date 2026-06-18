@@ -1,0 +1,14 @@
+[project]
+name = "lscope"
+version = "0.1.0"
+description = "ast-grep using ladybug"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ladybug>=0.17.1",
+    "polars>=1.41.2",
+    "pyarrow>=24.0.0",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-rust>=0.24.2",
+]
