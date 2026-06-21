@@ -5,6 +5,7 @@ description = "ast-grep using ladybug"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "icebug>=12.9",
     "ladybug>=0.17.1",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
