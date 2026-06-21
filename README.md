@@ -2,20 +2,23 @@ Ingest:
 
 
 ```
-$ uv run python3 main.py --schema-only -s schema.cypher
-Applied schema from schema.cypher to test.db
-
-$ uv run python3 main.py  --index icebug-format --language python
+$ uv run python3 main.py --index icebug-format --language python --workers 4
+Created schema from .../lscope/schema.cypher
 [1/9] python: .../icebug-format/icebug-format.py (0 symbols)
 ...
 [9/9] python: .../icebug-format/icebug_format/test_csr_duckdb.py (3 symbols)
 
-Ingested 9 file(s), 90 semantic node(s), and 149 resolved call(s) into test.db
+Ingested 9 file(s), 90 semantic node(s), and 149 resolved call(s) into test.db using 4 analysis thread(s)
   python: 9 file(s)
 
 $ du -sh test.db
 1.0M    test.db
 ```
+
+`--workers` controls parallel file reading and tree-sitter analysis. It defaults
+to a bounded CPU-based value. Database writes remain serialized.
+Indexing automatically creates the schema when the database is empty. Use
+`--schema PATH` to select a different schema file.
 
 Search:
 

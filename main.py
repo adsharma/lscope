@@ -5,7 +5,7 @@ and run lightweight code-intelligence queries (find functions / callers).
 A single invocation does exactly one of these jobs:
 
 * **index**  — parse one file, several files, or a whole project tree and store
-  the resulting ASTs in a ladybug database.
+  the resulting semantic graph in a Ladybug database.
 * **query**  — run a find-functions or find-callers search against an existing
   database.
 
@@ -17,7 +17,9 @@ non-sensical flag combinations are rejected up-front with a clear message.
 import argparse
 import os
 import sys
+import threading
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import ladybug
 import polars as pl
@@ -92,6 +94,18 @@ class LanguageRegistry:
     def parser_for_path(self, path: str) -> Parser | None:
         lang = self.language_for_path(path)
         return self._parsers[lang] if lang else None
+
+
+_worker_state = threading.local()
+
+
+def _worker_registry() -> LanguageRegistry:
+    """Return a parser registry owned by the current analysis thread."""
+    registry = getattr(_worker_state, "registry", None)
+    if registry is None:
+        registry = LanguageRegistry()
+        _worker_state.registry = registry
+    return registry
 
 
 # --------------------------------------------------------------------------- #
@@ -190,6 +204,13 @@ def _walk_dir(
 # --------------------------------------------------------------------------- #
 # Schema / DB helpers
 # --------------------------------------------------------------------------- #
+_REQUIRED_SCHEMA_TABLES = {"File", "Function", "Method", "Class", "CodeRelation"}
+
+
+def _default_schema_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.cypher")
+
+
 def _load_schema_text(schema_path: str | None) -> str | None:
     """Read schema.cypher and normalise the unsupported hash-index directive."""
     if not schema_path:
@@ -217,6 +238,26 @@ def apply_schema(conn, schema_text: str | None) -> None:
     except Exception as e:  # noqa: BLE001
         # tolerate "table already exists" when re-indexing into an existing DB
         print("Warning: executing schema raised an error; continuing. Error:", e)
+
+
+def ensure_schema(conn, schema_path: str | None = None) -> None:
+    """Create the semantic schema when the database has no graph tables."""
+    tables = conn.execute("CALL show_tables() RETURN name").get_as_pl()
+    existing = set(tables["name"].to_list()) if tables.height else set()
+    if _REQUIRED_SCHEMA_TABLES <= existing:
+        return
+    if existing:
+        missing = ", ".join(sorted(_REQUIRED_SCHEMA_TABLES - existing))
+        raise SystemExit(
+            "Database contains a partial or incompatible schema; "
+            f"missing required tables: {missing}."
+        )
+
+    selected_path = schema_path or _default_schema_path()
+    schema_text = _load_schema_text(selected_path)
+    assert schema_text is not None
+    conn.execute(schema_text)
+    print(f"Created schema from {selected_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +391,17 @@ def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
         "symbols": symbols,
         "calls": calls,
     }
+
+
+def analyze_path(path: str) -> dict:
+    """Read and analyze a file using a parser local to the worker thread."""
+    registry = _worker_registry()
+    language = registry.language_for_path(path)
+    if language is None:
+        raise ValueError(f"Cannot determine language for {path}")
+    with open(path, "r", encoding="utf8") as fh:
+        source = fh.read()
+    return analyze_file(path, language, source, registry.parser_for(language))
 
 
 def _create_relation(conn, source: dict, target: dict, rel_type: str, **props) -> None:
@@ -528,7 +580,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--schema",
         "-s",
         default=None,
-        help="Schema cypher file to execute (index) before ingest",
+        help="Schema file used to initialize an empty database",
     )
 
     index_grp = p.add_argument_group("indexing")
@@ -550,6 +602,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=installed or ["rust", "python"],
         default=None,
         help="Restrict indexing to a single language (default: all installed).",
+    )
+    index_grp.add_argument(
+        "--workers",
+        type=int,
+        default=min(32, (os.cpu_count() or 1) + 4),
+        help="File-analysis threads (default: %(default)s; database writes remain serialized).",
     )
 
     query_grp = p.add_argument_group("queries")
@@ -633,20 +691,23 @@ def run_index(args: argparse.Namespace) -> int:
         where = "the given paths" if args.language is None else f"{args.language} files"
         print(f"No indexable source files found in {where}.")
         return 0
+    if args.workers < 1:
+        raise SystemExit("--workers must be at least 1.")
 
     db, conn = _open_db(args.db)
     try:
-        apply_schema(conn, _load_schema_text(args.schema))
-        analyses = []
+        ensure_schema(conn, args.schema)
+        worker_count = min(args.workers, len(files))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="lscope-analyze",
+        ) as executor:
+            analyses = list(executor.map(analyze_path, files))
+
         per_lang: dict[str, int] = {}
-        for i, path in enumerate(files, 1):
-            lang = registry.language_for_path(path)
-            assert lang is not None  # filtered by iter_source_files
-            parser = registry.parser_for(lang)
-            with open(path, "r", encoding="utf8") as fh:
-                source = fh.read()
-            analysis = analyze_file(path, lang, source, parser)
-            analyses.append(analysis)
+        for i, analysis in enumerate(analyses, 1):
+            path = analysis["file"]["path"]
+            lang = analysis["file"]["language"]
             per_lang[lang] = per_lang.get(lang, 0) + 1
             print(
                 f"[{i}/{len(files)}] {lang}: {path} "
@@ -659,7 +720,8 @@ def run_index(args: argparse.Namespace) -> int:
         call_count = ingest_calls(conn, analyses)
         print(
             f"\nIngested {len(files)} file(s), {total_nodes} semantic node(s), "
-            f"and {call_count} resolved call(s) into {args.db}"
+            f"and {call_count} resolved call(s) into {args.db} "
+            f"using {worker_count} analysis thread(s)"
         )
         for lang, count in sorted(per_lang.items()):
             print(f"  {lang}: {count} file(s)")
