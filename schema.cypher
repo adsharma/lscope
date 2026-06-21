@@ -1,4 +1,5 @@
 CALL disable_default_hash_index=true;
+CALL debug_enable_multi_writes=true;
 
 // Semantic code-graph schema.
 //

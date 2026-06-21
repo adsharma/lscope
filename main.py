@@ -144,6 +144,7 @@ _DEFAULT_IGNORE_DIRS = {
     ".pytest_cache",
     ".ruff_cache",
     "node_modules",
+    ".pixi",
     ".tox",
     "dist",
     "build",
@@ -504,28 +505,51 @@ def analyze_path(path: str) -> dict:
     return analyze_file(path, language, source, registry.parser_for(language))
 
 
-def _create_relation(conn, source: dict, target: dict, rel_type: str, **props) -> None:
-    query = (
-        f"MATCH (a:{source['label']} {{id: $source_id}}), "
-        f"(b:{target['label']} {{id: $target_id}}) "
-        "CREATE (a)-[:CodeRelation {type: $type, confidence: $confidence, "
-        "reason: $reason, step: $step}]->(b)"
-    )
-    conn.execute(
-        query,
-        {
-            "source_id": source["id"],
-            "target_id": target["id"],
-            "type": rel_type,
-            "confidence": props.get("confidence", 1.0),
-            "reason": props.get("reason", ""),
-            "step": props.get("step", 0),
-        },
-    )
+def _ingest_relations(
+    conn,
+    edges: Iterable[tuple[dict, dict, str, float, str, int]],
+) -> None:
+    """
+    Create CodeRelation edges in bulk.
+
+    ``edges`` yields ``(source, target, rel_type, confidence, reason, step)``
+    tuples where ``source`` / ``target`` are symbol dicts carrying ``id`` and
+    ``label``.  Edges are grouped by ``(source.label, target.label)`` so each
+    pair becomes a single ``UNWIND`` + ``MATCH`` + ``CREATE`` instead of one
+    query per edge.
+    """
+    by_pair: dict[tuple[str, str], list[dict]] = {}
+    for source, target, rel_type, confidence, reason, step in edges:
+        key = (source["label"], target["label"])
+        by_pair.setdefault(key, []).append(
+            {
+                "src": source["id"],
+                "dst": target["id"],
+                "type": rel_type,
+                "confidence": confidence,
+                "reason": reason,
+                "step": step,
+            }
+        )
+    for (src_label, dst_label), rows in by_pair.items():
+        conn.execute(
+            f"UNWIND $rows AS row "
+            f"MATCH (a:{src_label} {{id: row.src}}), "
+            f"(b:{dst_label} {{id: row.dst}}) "
+            "CREATE (a)-[:CodeRelation {type: row.type, "
+            "confidence: row.confidence, reason: row.reason, "
+            "step: row.step}]->(b)",
+            {"rows": rows},
+        )
 
 
 def ingest_analysis(conn, analysis: dict) -> int:
-    """Write one analyzed file's nodes and definition relationships."""
+    """Write one analyzed file's nodes and definition relationships.
+
+    Nodes are upserted in one ``UNWIND`` per label (the SET clause is shared by
+    every semantic label) and the File→/DEFINES/HAS_METHOD edges are written in
+    a single bulk pass, collapsing ~2N+1 round-trips down to a handful.
+    """
     file = analysis["file"]
     conn.execute(
         "MERGE (f:File {id: $id}) SET f.name = $name, f.path = $path, "
@@ -534,51 +558,60 @@ def ingest_analysis(conn, analysis: dict) -> int:
     )
     file_ref = {"id": file["id"], "label": "File"}
 
+    # Group symbols by label so each distinct label is one UNWIND statement.
+    by_label: dict[str, list[dict]] = {}
     for symbol in analysis["symbols"]:
-        label = symbol["label"]
-        params = {
-            "id": symbol["id"],
-            "name": symbol["name"],
-            "qualified_name": symbol["qualified_name"],
-            "file_path": symbol["file_path"],
-            "language": symbol["language"],
-            "start_line": symbol["start_line"],
-            "end_line": symbol["end_line"],
-        }
-        if label == "Class":
-            conn.execute(
-                "MERGE (n:Class {id: $id}) SET n.name = $name, "
-                "n.qualifiedName = $qualified_name, n.filePath = $file_path, "
-                "n.language = $language, n.startLine = $start_line, "
-                "n.endLine = $end_line",
-                params,
-            )
-        else:
-            conn.execute(
-                f"MERGE (n:{label} {{id: $id}}) SET n.name = $name, "
-                "n.qualifiedName = $qualified_name, n.filePath = $file_path, "
-                "n.language = $language, n.startLine = $start_line, "
-                "n.endLine = $end_line",
-                params,
-            )
-        _create_relation(
-            conn,
-            symbol.get("owner") or file_ref,
-            symbol,
-            symbol["relation"],
+        by_label.setdefault(symbol["label"], []).append(
+            {
+                "id": symbol["id"],
+                "name": symbol["name"],
+                "qualified_name": symbol["qualified_name"],
+                "file_path": symbol["file_path"],
+                "language": symbol["language"],
+                "start_line": symbol["start_line"],
+                "end_line": symbol["end_line"],
+            }
         )
+    for label, rows in by_label.items():
+        conn.execute(
+            f"UNWIND $rows AS row "
+            f"MERGE (n:{label} {{id: row.id}}) "
+            "SET n.name = row.name, n.qualifiedName = row.qualified_name, "
+            "n.filePath = row.file_path, n.language = row.language, "
+            "n.startLine = row.start_line, n.endLine = row.end_line",
+            {"rows": rows},
+        )
+
+    _ingest_relations(
+        conn,
+        (
+            (
+                symbol.get("owner") or file_ref,
+                symbol,
+                symbol["relation"],
+                1.0,
+                "",
+                0,
+            )
+            for symbol in analysis["symbols"]
+        ),
+    )
     return 1 + len(analysis["symbols"])
 
 
 def ingest_calls(conn, analyses: list[dict]) -> int:
-    """Resolve calls by name, preferring a declaration in the same file."""
+    """Resolve calls by name, preferring a declaration in the same file.
+
+    Resolution stays a single global pass; only the writes are batched into one
+    ``CREATE`` per ``(caller_label, target_label)`` pair via ``_ingest_relations``.
+    """
     by_name: dict[str, list[dict]] = {}
     for analysis in analyses:
         for symbol in analysis["symbols"]:
             if symbol["label"] in {"Function", "Method"}:
                 by_name.setdefault(symbol["name"], []).append(symbol)
 
-    count = 0
+    edges: list[tuple[dict, dict, str, float, str, int]] = []
     for analysis in analyses:
         for call in analysis["calls"]:
             candidates = by_name.get(call["callee_name"], [])
@@ -588,16 +621,54 @@ def ingest_calls(conn, analyses: list[dict]) -> int:
                 (s for s in candidates if s["file_path"] == call["file_path"]),
                 candidates[0],
             )
-            _create_relation(
-                conn,
-                call["caller"],
-                target,
-                "CALLS",
-                confidence=1.0 if len(candidates) == 1 else 0.7,
-                reason=f"call at {call['file_path']}:{call['line']}",
+            edges.append(
+                (
+                    call["caller"],
+                    target,
+                    "CALLS",
+                    1.0 if len(candidates) == 1 else 0.7,
+                    f"call at {call['file_path']}:{call['line']}",
+                    0,
+                )
             )
-            count += 1
-    return count
+    _ingest_relations(conn, edges)
+    return len(edges)
+
+
+def ingest_analyses_parallel(
+    db, analyses: list[dict], workers: int
+) -> int:
+    """
+    Ingest nodes + DEFINES/HAS_METHOD edges for many files in parallel.
+
+    Each worker thread owns its own ``Connection`` to the shared ``Database``
+    (opened with ``enable_multi_writes=True`` so concurrent write transactions
+    are permitted).  Analyses are split round-robin into ``workers`` chunks so
+    per-file node/edge batches stay independent and need no cross-thread
+    coordination.  Returns the total number of nodes written.
+    """
+    if not analyses:
+        return 0
+    workers = max(1, min(workers, len(analyses)))
+    total = 0
+
+    def _run(chunk: list[dict]) -> int:
+        conn = ladybug.Connection(db)
+        try:
+            return sum(ingest_analysis(conn, a) for a in chunk)
+        finally:
+            conn.close()
+
+    chunks: list[list[dict]] = [[] for _ in range(workers)]
+    for i, analysis in enumerate(analyses):
+        chunks[i % workers].append(analysis)
+
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="lscope-ingest"
+    ) as executor:
+        for n in executor.map(_run, chunks):
+            total += n
+    return total
 
 
 # --------------------------------------------------------------------------- #
@@ -707,7 +778,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=min(32, (os.cpu_count() or 1) + 4),
-        help="File-analysis threads (default: %(default)s; database writes remain serialized).",
+        help=(
+            "Threads for both file analysis and DB ingestion "
+            "(default: %(default)s)."
+        ),
     )
 
     query_grp = p.add_argument_group("queries")
@@ -767,10 +841,52 @@ def _resolve_actions(args: argparse.Namespace) -> str:
 # --------------------------------------------------------------------------- #
 # Command runners
 # --------------------------------------------------------------------------- #
-def _open_db(db_path: str, *, read_only: bool = False):
-    db = ladybug.Database(db_path, read_only=read_only)
+def _open_db(db_path: str, *, read_only: bool = False, multi_writes: bool = False):
+    db = ladybug.Database(db_path, read_only=read_only, enable_multi_writes=multi_writes)
     conn = ladybug.Connection(db)
     return db, conn
+
+
+# How long to wait for the native database background thread to wind down before
+# giving up and letting the process exit anyway.  db.close() joins a libuv
+# event-loop thread that can, in rare shutdown races, never receive its stop
+# signal and park forever in kevent.  Running the close on a daemon thread with
+# a bounded join turns that hard hang into (at worst) a short delay plus a
+# warning, since daemon threads do not block interpreter shutdown.
+_DB_CLOSE_TIMEOUT = 10.0
+
+
+def _close_db(db, timeout: float = _DB_CLOSE_TIMEOUT) -> None:
+    """Close ``db`` without letting a stuck native join hang the caller.
+
+    ``ladybug.Database.close`` blocks on a background event-loop thread; under a
+    rare teardown race that join never completes.  We run the close on a daemon
+    thread and join with a bounded ``timeout``: if it finishes, great; if not,
+    the main thread proceeds and the daemon is torn down at process exit.
+    """
+    if db is None:
+        return
+    error: list[BaseException] = []
+
+    def _do_close():
+        try:
+            db.close()
+        except BaseException as exc:  # noqa: BLE001
+            error.append(exc)
+
+    worker = threading.Thread(
+        target=_do_close, name="lscope-db-close", daemon=True
+    )
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        print(
+            f"warning: database close did not finish within {timeout:g}s; "
+            "abandoning the background thread and exiting",
+            file=sys.stderr,
+        )
+    elif error:
+        raise error[0]
 
 
 def run_index(args: argparse.Namespace) -> int:
@@ -794,7 +910,7 @@ def run_index(args: argparse.Namespace) -> int:
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1.")
 
-    db, conn = _open_db(args.db)
+    db, conn = _open_db(args.db, multi_writes=True)
     try:
         ensure_schema(conn, args.schema)
         worker_count = min(args.workers, len(files))
@@ -814,9 +930,11 @@ def run_index(args: argparse.Namespace) -> int:
                 f"({len(analysis['symbols'])} symbols)"
             )
 
-        total_nodes = 0
-        for analysis in analyses:
-            total_nodes += ingest_analysis(conn, analysis)
+        # Nodes + DEFINES/HAS_METHOD edges: parallelized across worker threads,
+        # each with its own connection to the shared multi-write database.
+        total_nodes = ingest_analyses_parallel(db, analyses, worker_count)
+        # Calls need every node already written and a global name index, so they
+        # stay single-threaded on the main connection.
         call_count = ingest_calls(conn, analyses)
         print(
             f"\nIngested {len(files)} file(s), {total_nodes} semantic node(s), "
@@ -827,7 +945,7 @@ def run_index(args: argparse.Namespace) -> int:
             print(f"  {lang}: {count} file(s)")
     finally:
         conn.close()
-        db.close()
+        _close_db(db)
     return 0
 
 
@@ -839,7 +957,7 @@ def run_find_functions(args: argparse.Namespace) -> int:
         print(df)
     finally:
         conn.close()
-        db.close()
+        _close_db(db)
     return 0
 
 
@@ -851,7 +969,7 @@ def run_find_callers(args: argparse.Namespace) -> int:
         print(df)
     finally:
         conn.close()
-        db.close()
+        _close_db(db)
     return 0
 
 
@@ -865,7 +983,7 @@ def run_schema_only(args: argparse.Namespace) -> int:
         print(f"Applied schema from {args.schema} to {args.db}")
     finally:
         conn.close()
-        db.close()
+        _close_db(db)
     return 0
 
 
