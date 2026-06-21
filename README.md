@@ -20,6 +20,9 @@ to a bounded CPU-based value. Database writes remain serialized.
 Indexing automatically creates the schema when the database is empty. Use
 `--schema PATH` to select a different schema file.
 
+Supported languages: Python, JavaScript, TypeScript, Java, C#, C++, Go, Rust,
+Swift, and Kotlin.
+
 Search:
 
 ```

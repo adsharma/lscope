@@ -36,6 +36,26 @@ from tree_sitter import Language, Parser
 _LANGUAGE_SPECS = {
     "rust": ("tree_sitter_rust", "language", ("rs",)),
     "python": ("tree_sitter_python", "language", ("py", "pyi")),
+    "javascript": (
+        "tree_sitter_javascript",
+        "language",
+        ("js", "jsx", "mjs", "cjs"),
+    ),
+    "typescript": (
+        "tree_sitter_typescript",
+        "language_typescript",
+        ("ts", "tsx", "mts", "cts"),
+    ),
+    "java": ("tree_sitter_java", "language", ("java",)),
+    "csharp": ("tree_sitter_c_sharp", "language", ("cs",)),
+    "cpp": (
+        "tree_sitter_cpp",
+        "language",
+        ("cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"),
+    ),
+    "go": ("tree_sitter_go", "language", ("go",)),
+    "swift": ("tree_sitter_swift", "language", ("swift",)),
+    "kotlin": ("tree_sitter_kotlin", "language", ("kt", "kts")),
 }
 
 
@@ -263,20 +283,43 @@ def ensure_schema(conn, schema_path: str | None = None) -> None:
 # --------------------------------------------------------------------------- #
 # Semantic ingestion
 # --------------------------------------------------------------------------- #
-_CLASS_KINDS = {"class_definition", "class_declaration"}
+_CONTAINER_KINDS = {
+    "class_definition": "Class",
+    "class_declaration": "Class",
+    "class_specifier": "Class",
+    "object_declaration": "Class",
+    "struct_declaration": "Struct",
+    "struct_item": "Struct",
+    "protocol_declaration": "Interface",
+    "interface_declaration": "Interface",
+    "trait_item": "Trait",
+    "impl_item": "Impl",
+}
 _FUNCTION_KINDS = {
     "function_definition",
     "function_item",
     "function_declaration",
+    "local_function_statement",
     "method_definition",
     "method_declaration",
+    "constructor_declaration",
+    "init_declaration",
 }
 _CALL_KINDS = {
     "call",
     "call_expression",
     "function_call",
+    "invocation_expression",
+    "method_invocation",
     "method_call",
     "macro_invocation",
+}
+_METHOD_KINDS = {
+    "constructor_declaration",
+    "init_declaration",
+    "local_function_statement",
+    "method_declaration",
+    "method_definition",
 }
 
 
@@ -287,6 +330,21 @@ def _node_text(node, source_bytes: bytes) -> str:
 def _field_text(node, field: str, source_bytes: bytes) -> str | None:
     child = node.child_by_field_name(field)
     return _node_text(child, source_bytes) if child is not None else None
+
+
+def _declaration_name(node, source_bytes: bytes) -> str | None:
+    """Extract names, following C/C++ nested declarators when necessary."""
+    name = _field_text(node, "name", source_bytes)
+    if name:
+        return name
+    declarator = node.child_by_field_name("declarator")
+    while declarator is not None:
+        nested = declarator.child_by_field_name("declarator")
+        if nested is None:
+            text = _node_text(declarator, source_bytes)
+            return text.split("::")[-1]
+        declarator = nested
+    return None
 
 
 def _called_name(node, source_bytes: bytes) -> str | None:
@@ -316,17 +374,24 @@ def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
     symbols: list[dict] = []
     calls: list[dict] = []
 
-    def visit(node, owner: dict, class_owner: dict | None = None) -> None:
+    def visit(node, owner: dict, type_owner: dict | None = None) -> None:
         next_owner = owner
-        next_class = class_owner
+        next_type = type_owner
 
-        if node.type in _CLASS_KINDS:
-            name = _field_text(node, "name", source_bytes)
+        if node.type in _CONTAINER_KINDS:
+            label = _CONTAINER_KINDS[node.type]
+            if node.type == "class_specifier" and node.children:
+                label = "Struct" if node.children[0].type == "struct" else "Class"
+            name = (
+                _field_text(node, "type", source_bytes)
+                if label == "Impl"
+                else _declaration_name(node, source_bytes)
+            )
             if name:
                 symbol = {
-                    "id": f"class:{path}#{node.start_byte}",
-                    "label": "Class",
-                    "name": name,
+                    "id": f"{label.lower()}:{path}#{node.start_byte}",
+                    "label": label,
+                    "name": f"impl {name}" if label == "Impl" else name,
                     "qualified_name": name,
                     "file_path": path,
                     "language": language,
@@ -337,31 +402,34 @@ def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
                 }
                 symbols.append(symbol)
                 next_owner = symbol
-                next_class = symbol
+                next_type = symbol
 
         elif node.type in _FUNCTION_KINDS:
-            name = _field_text(node, "name", source_bytes)
+            name = _declaration_name(node, source_bytes)
             if name:
-                label = "Method" if class_owner is not None else "Function"
+                is_method = type_owner is not None or node.type in _METHOD_KINDS
+                if node.child_by_field_name("receiver") is not None:
+                    is_method = True
+                label = "Method" if is_method else "Function"
                 symbol = {
                     "id": f"{label.lower()}:{path}#{node.start_byte}",
                     "label": label,
                     "name": name,
                     "qualified_name": (
-                        f"{class_owner['qualified_name']}.{name}"
-                        if class_owner is not None
+                        f"{type_owner['qualified_name']}.{name}"
+                        if type_owner is not None
                         else name
                     ),
                     "file_path": path,
                     "language": language,
                     "start_line": node.start_point.row + 1,
                     "end_line": node.end_point.row + 1,
-                    "owner": class_owner or owner,
-                    "relation": "HAS_METHOD" if class_owner else "DEFINES",
+                    "owner": type_owner or owner,
+                    "relation": "HAS_METHOD" if type_owner else "DEFINES",
                 }
                 symbols.append(symbol)
                 next_owner = symbol
-                next_class = None
+                next_type = None
 
         if node.type in _CALL_KINDS:
             name = _called_name(node, source_bytes)
@@ -376,7 +444,7 @@ def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
                 )
 
         for child in node.named_children:
-            visit(child, next_owner, next_class)
+            visit(child, next_owner, next_type)
 
     file_owner = {"id": file_id, "label": "File"}
     visit(tree.root_node, file_owner)

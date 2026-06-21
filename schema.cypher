@@ -155,9 +155,8 @@ CREATE NODE TABLE Tool (
     PRIMARY KEY (id)
 );
 
-// Language-specific semantic nodes use escaped names so they remain portable
-// when a node name is also a language keyword.
-CREATE NODE TABLE `Struct` (
+// Language-specific semantic node types.
+CREATE NODE TABLE Struct (
     id              STRING,
     name            STRING,
     qualifiedName   STRING,
@@ -169,7 +168,7 @@ CREATE NODE TABLE `Struct` (
     PRIMARY KEY (id)
 );
 
-CREATE NODE TABLE `Enum` (
+CREATE NODE TABLE Enum (
     id              STRING,
     name            STRING,
     qualifiedName   STRING,
@@ -181,7 +180,7 @@ CREATE NODE TABLE `Enum` (
     PRIMARY KEY (id)
 );
 
-CREATE NODE TABLE `Trait` (
+CREATE NODE TABLE Trait (
     id              STRING,
     name            STRING,
     qualifiedName   STRING,
@@ -193,7 +192,7 @@ CREATE NODE TABLE `Trait` (
     PRIMARY KEY (id)
 );
 
-CREATE NODE TABLE `Impl` (
+CREATE NODE TABLE Impl (
     id              STRING,
     name            STRING,
     qualifiedName   STRING,
@@ -216,10 +215,10 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM File TO CodeElement,
     FROM File TO Route,
     FROM File TO Tool,
-    FROM File TO `Struct`,
-    FROM File TO `Enum`,
-    FROM File TO `Trait`,
-    FROM File TO `Impl`,
+    FROM File TO Struct,
+    FROM File TO Enum,
+    FROM File TO Trait,
+    FROM File TO Impl,
 
     // Nested declarations and members.
     FROM Class TO Class,
@@ -227,18 +226,18 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM Class TO Property,
     FROM Interface TO Method,
     FROM Interface TO Property,
-    FROM `Struct` TO Method,
-    FROM `Struct` TO Property,
-    FROM `Enum` TO Method,
-    FROM `Enum` TO Property,
-    FROM `Trait` TO Method,
-    FROM `Trait` TO Property,
-    FROM `Impl` TO Method,
-    FROM `Impl` TO Property,
-    FROM `Impl` TO Class,
-    FROM `Impl` TO `Struct`,
-    FROM `Impl` TO `Enum`,
-    FROM `Impl` TO `Trait`,
+    FROM Struct TO Method,
+    FROM Struct TO Property,
+    FROM Enum TO Method,
+    FROM Enum TO Property,
+    FROM Trait TO Method,
+    FROM Trait TO Property,
+    FROM Impl TO Method,
+    FROM Impl TO Property,
+    FROM Impl TO Class,
+    FROM Impl TO Struct,
+    FROM Impl TO Enum,
+    FROM Impl TO Trait,
 
     // Imports, inheritance, implementation, calls, and property access.
     FROM File TO File,
@@ -249,13 +248,13 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM Method TO Method,
     FROM Method TO Property,
     FROM Class TO Interface,
-    FROM Class TO `Trait`,
-    FROM `Struct` TO Interface,
-    FROM `Struct` TO `Trait`,
-    FROM `Enum` TO Interface,
-    FROM `Enum` TO `Trait`,
+    FROM Class TO Trait,
+    FROM Struct TO Interface,
+    FROM Struct TO Trait,
+    FROM Enum TO Interface,
+    FROM Enum TO Trait,
     FROM Interface TO Interface,
-    FROM `Trait` TO `Trait`,
+    FROM Trait TO Trait,
 
     // Communities and process traces.
     FROM File TO Community,
@@ -267,10 +266,10 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM CodeElement TO Community,
     FROM Route TO Community,
     FROM Tool TO Community,
-    FROM `Struct` TO Community,
-    FROM `Enum` TO Community,
-    FROM `Trait` TO Community,
-    FROM `Impl` TO Community,
+    FROM Struct TO Community,
+    FROM Enum TO Community,
+    FROM Trait TO Community,
+    FROM Impl TO Community,
     FROM File TO Process,
     FROM Function TO Process,
     FROM Class TO Process,
@@ -280,10 +279,10 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM CodeElement TO Process,
     FROM Route TO Process,
     FROM Tool TO Process,
-    FROM `Struct` TO Process,
-    FROM `Enum` TO Process,
-    FROM `Trait` TO Process,
-    FROM `Impl` TO Process,
+    FROM Struct TO Process,
+    FROM Enum TO Process,
+    FROM Trait TO Process,
+    FROM Impl TO Process,
 
     // Framework routes, external fetches, and tool handlers.
     FROM Function TO Route,
