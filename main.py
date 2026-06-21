@@ -1,5 +1,5 @@
 """
-lscope — ingest source code ASTs (via tree-sitter) into a ladybug graph DB
+lscope — extract a semantic code graph (via tree-sitter) into a Ladybug DB
 and run lightweight code-intelligence queries (find functions / callers).
 
 A single invocation does exactly one of these jobs:
@@ -220,240 +220,289 @@ def apply_schema(conn, schema_text: str | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Ingestion
+# Semantic ingestion
 # --------------------------------------------------------------------------- #
-def ingest_file(conn, path: str, language: str, source: str, parser: Parser) -> int:
-    """
-    Parse one file with ``parser`` and write its AST into ``conn``.
-
-    Returns the number of AST nodes written.
-
-    The node id scheme is ``"<path>#<preorder_index>"``.  Re-ingesting the same
-    file re-uses the same ids (via MERGE), so a single DB can be incrementally
-    updated.
-    """
-    tree = parser.parse(source.encode())
-
-    conn.execute("BEGIN TRANSACTION")
-    conn.execute(
-        "MERGE (f:File {path: $path}) SET f.language = $lang, f.source = $src",
-        {"path": path, "lang": language, "src": source},
-    )
-
-    nodes = []
-    edges = []
-    counter = 0
-
-    def visit(node, parent_id=None, field=None, child_index=0, named_index=-1):
-        nonlocal counter
-        node_id = f"{path}#{counter}"
-        counter += 1
-        is_leaf = node.child_count == 0
-        nodes.append(
-            {
-                "id": node_id,
-                "kind": node.type,
-                "is_named": bool(getattr(node, "is_named", True)),
-                "is_leaf": is_leaf,
-                "is_error": bool(getattr(node, "is_error", False)),
-                "is_missing": bool(getattr(node, "is_missing", False)),
-                "is_extra": bool(getattr(node, "is_extra", False)),
-                "start_byte": int(getattr(node, "start_byte", 0)),
-                "end_byte": int(getattr(node, "end_byte", 0)),
-                "start_row": int(getattr(node, "start_point", (0, 0))[0]),
-                "start_col": int(getattr(node, "start_point", (0, 0))[1]),
-                "end_row": int(getattr(node, "end_point", (0, 0))[0]),
-                "end_col": int(getattr(node, "end_point", (0, 0))[1]),
-                "child_count": int(getattr(node, "child_count", 0)),
-                "named_child_count": int(getattr(node, "named_child_count", 0)),
-                "text": (
-                    source[
-                        getattr(node, "start_byte", 0) : getattr(node, "end_byte", 0)
-                    ]
-                    if is_leaf
-                    else None
-                ),
-            }
-        )
-        if parent_id is not None:
-            edges.append(
-                {
-                    "from": parent_id,
-                    "to": node_id,
-                    "field": field or "",
-                    "child_index": child_index,
-                    "named_child_index": named_index,
-                }
-            )
-        named_i = 0
-        for i, child in enumerate(getattr(node, "children", [])):
-            try:
-                f_name = node.field_name_for_child(i)
-            except Exception:
-                f_name = None
-            visit(
-                child,
-                node_id,
-                f_name,
-                i,
-                named_i if getattr(child, "is_named", False) else -1,
-            )
-            if getattr(child, "is_named", False):
-                named_i += 1
-        return node_id
-
-    root_id = visit(tree.root_node)
-
-    for n in nodes:
-        params = {
-            "id": n["id"],
-            "kind": n["kind"],
-            "is_named": n["is_named"],
-            "is_leaf": n["is_leaf"],
-            "is_error": n["is_error"],
-            "is_missing": n["is_missing"],
-            "is_extra": n["is_extra"],
-            "start_byte": n["start_byte"],
-            "end_byte": n["end_byte"],
-            "start_row": n["start_row"],
-            "start_col": n["start_col"],
-            "end_row": n["end_row"],
-            "end_col": n["end_col"],
-            "child_count": n["child_count"],
-            "named_child_count": n["named_child_count"],
-            "text": n["text"],
-        }
-        conn.execute(
-            "MERGE (nd:AstNode {id: $id}) SET nd.kind = $kind, nd.is_named = $is_named, nd.is_leaf = $is_leaf, "
-            "nd.is_error = $is_error, nd.is_missing = $is_missing, nd.is_extra = $is_extra, "
-            "nd.start_byte = $start_byte, nd.end_byte = $end_byte, nd.start_row = $start_row, nd.start_col = $start_col, "
-            "nd.end_row = $end_row, nd.end_col = $end_col, nd.child_count = $child_count, nd.named_child_count = $named_child_count, "
-            "nd.text = $text",
-            params,
-        )
-
-    for e in edges:
-        conn.execute(
-            "MATCH (a:AstNode {id: $from}), (b:AstNode {id: $to}) "
-            "CREATE (a)-[:CHILD {field: $field, child_index: $child_index, "
-            "named_child_index: $named_child_index}]->(b)",
-            e,
-        )
-
-    conn.execute(
-        "MATCH (f:File {path: $path}), (r:AstNode {id: $rid}) CREATE (f)-[:ROOT_OF]->(r)",
-        {"path": path, "rid": root_id},
-    )
-    conn.execute("COMMIT")
-
-    # clean up any stale edges if this file was previously ingested
-    _prune_stale_file_edges(conn, path, root_id)
-    return len(nodes)
-
-
-def _prune_stale_file_edges(conn, path: str, current_root_id: str) -> None:
-    """Best-effort: when re-indexing, drop dangling ROOT_OF edges for old roots."""
-    try:
-        conn.execute(
-            "MATCH (f:File {path: $path})-[r:ROOT_OF]->(old) "
-            "WHERE old.id <> $rid DELETE r",
-            {"path": path, "rid": current_root_id},
-        )
-    except Exception:
-        # not all cypher dialects support this; failure is non-fatal
-        pass
-
-
-# --------------------------------------------------------------------------- #
-# Queries
-# --------------------------------------------------------------------------- #
-# Node kinds that represent a function/method declaration, kept broad so a
-# single query works across languages:
-#   python: function_definition
-#   rust:   function_item
-#   javascript/typescript/go: function_declaration / method_declaration
-_FUNCTION_KINDS = [
+_CLASS_KINDS = {"class_definition", "class_declaration"}
+_FUNCTION_KINDS = {
     "function_definition",
     "function_item",
     "function_declaration",
     "method_definition",
     "method_declaration",
-]
-# Node kinds that represent a call.  Both python's `call` and rust's
-# `call_expression` / `macro_invocation` (for macro-style calls) are covered.
-_CALL_KINDS = [
+}
+_CALL_KINDS = {
     "call",
     "call_expression",
     "function_call",
     "method_call",
     "macro_invocation",
-]
+}
 
 
+def _node_text(node, source_bytes: bytes) -> str:
+    return source_bytes[node.start_byte : node.end_byte].decode("utf8")
+
+
+def _field_text(node, field: str, source_bytes: bytes) -> str | None:
+    child = node.child_by_field_name(field)
+    return _node_text(child, source_bytes) if child is not None else None
+
+
+def _called_name(node, source_bytes: bytes) -> str | None:
+    """Return the terminal name of a Python/Rust call expression."""
+    callee = (
+        node.child_by_field_name("function")
+        or node.child_by_field_name("name")
+        or node.child_by_field_name("macro")
+    )
+    if callee is None and node.named_child_count:
+        callee = node.named_children[0]
+    if callee is None:
+        return None
+
+    for field in ("attribute", "field", "name"):
+        terminal = callee.child_by_field_name(field)
+        if terminal is not None:
+            return _node_text(terminal, source_bytes).rstrip("!")
+    return _node_text(callee, source_bytes).split("::")[-1].rstrip("!")
+
+
+def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
+    """Extract semantic declarations and calls from one source file."""
+    source_bytes = source.encode()
+    tree = parser.parse(source_bytes)
+    file_id = f"file:{path}"
+    symbols: list[dict] = []
+    calls: list[dict] = []
+
+    def visit(node, owner: dict, class_owner: dict | None = None) -> None:
+        next_owner = owner
+        next_class = class_owner
+
+        if node.type in _CLASS_KINDS:
+            name = _field_text(node, "name", source_bytes)
+            if name:
+                symbol = {
+                    "id": f"class:{path}#{node.start_byte}",
+                    "label": "Class",
+                    "name": name,
+                    "qualified_name": name,
+                    "file_path": path,
+                    "language": language,
+                    "start_line": node.start_point.row + 1,
+                    "end_line": node.end_point.row + 1,
+                    "owner": owner,
+                    "relation": "DEFINES",
+                }
+                symbols.append(symbol)
+                next_owner = symbol
+                next_class = symbol
+
+        elif node.type in _FUNCTION_KINDS:
+            name = _field_text(node, "name", source_bytes)
+            if name:
+                label = "Method" if class_owner is not None else "Function"
+                symbol = {
+                    "id": f"{label.lower()}:{path}#{node.start_byte}",
+                    "label": label,
+                    "name": name,
+                    "qualified_name": (
+                        f"{class_owner['qualified_name']}.{name}"
+                        if class_owner is not None
+                        else name
+                    ),
+                    "file_path": path,
+                    "language": language,
+                    "start_line": node.start_point.row + 1,
+                    "end_line": node.end_point.row + 1,
+                    "owner": class_owner or owner,
+                    "relation": "HAS_METHOD" if class_owner else "DEFINES",
+                }
+                symbols.append(symbol)
+                next_owner = symbol
+                next_class = None
+
+        if node.type in _CALL_KINDS:
+            name = _called_name(node, source_bytes)
+            if name:
+                calls.append(
+                    {
+                        "caller": owner,
+                        "callee_name": name,
+                        "file_path": path,
+                        "line": node.start_point.row + 1,
+                    }
+                )
+
+        for child in node.named_children:
+            visit(child, next_owner, next_class)
+
+    file_owner = {"id": file_id, "label": "File"}
+    visit(tree.root_node, file_owner)
+    return {
+        "file": {
+            "id": file_id,
+            "name": os.path.basename(path),
+            "path": path,
+            "language": language,
+            "source": source,
+        },
+        "symbols": symbols,
+        "calls": calls,
+    }
+
+
+def _create_relation(conn, source: dict, target: dict, rel_type: str, **props) -> None:
+    query = (
+        f"MATCH (a:{source['label']} {{id: $source_id}}), "
+        f"(b:{target['label']} {{id: $target_id}}) "
+        "CREATE (a)-[:CodeRelation {type: $type, confidence: $confidence, "
+        "reason: $reason, step: $step}]->(b)"
+    )
+    conn.execute(
+        query,
+        {
+            "source_id": source["id"],
+            "target_id": target["id"],
+            "type": rel_type,
+            "confidence": props.get("confidence", 1.0),
+            "reason": props.get("reason", ""),
+            "step": props.get("step", 0),
+        },
+    )
+
+
+def ingest_analysis(conn, analysis: dict) -> int:
+    """Write one analyzed file's nodes and definition relationships."""
+    file = analysis["file"]
+    conn.execute(
+        "MERGE (f:File {id: $id}) SET f.name = $name, f.path = $path, "
+        "f.filePath = $path, f.language = $language, f.source = $source",
+        file,
+    )
+    file_ref = {"id": file["id"], "label": "File"}
+
+    for symbol in analysis["symbols"]:
+        label = symbol["label"]
+        params = {
+            "id": symbol["id"],
+            "name": symbol["name"],
+            "qualified_name": symbol["qualified_name"],
+            "file_path": symbol["file_path"],
+            "language": symbol["language"],
+            "start_line": symbol["start_line"],
+            "end_line": symbol["end_line"],
+        }
+        if label == "Class":
+            conn.execute(
+                "MERGE (n:Class {id: $id}) SET n.name = $name, "
+                "n.qualifiedName = $qualified_name, n.filePath = $file_path, "
+                "n.language = $language, n.startLine = $start_line, "
+                "n.endLine = $end_line",
+                params,
+            )
+        else:
+            conn.execute(
+                f"MERGE (n:{label} {{id: $id}}) SET n.name = $name, "
+                "n.qualifiedName = $qualified_name, n.filePath = $file_path, "
+                "n.language = $language, n.startLine = $start_line, "
+                "n.endLine = $end_line",
+                params,
+            )
+        _create_relation(
+            conn,
+            symbol.get("owner") or file_ref,
+            symbol,
+            symbol["relation"],
+        )
+    return 1 + len(analysis["symbols"])
+
+
+def ingest_calls(conn, analyses: list[dict]) -> int:
+    """Resolve calls by name, preferring a declaration in the same file."""
+    by_name: dict[str, list[dict]] = {}
+    for analysis in analyses:
+        for symbol in analysis["symbols"]:
+            if symbol["label"] in {"Function", "Method"}:
+                by_name.setdefault(symbol["name"], []).append(symbol)
+
+    count = 0
+    for analysis in analyses:
+        for call in analysis["calls"]:
+            candidates = by_name.get(call["callee_name"], [])
+            if not candidates:
+                continue
+            target = next(
+                (s for s in candidates if s["file_path"] == call["file_path"]),
+                candidates[0],
+            )
+            _create_relation(
+                conn,
+                call["caller"],
+                target,
+                "CALLS",
+                confidence=1.0 if len(candidates) == 1 else 0.7,
+                reason=f"call at {call['file_path']}:{call['line']}",
+            )
+            count += 1
+    return count
+
+
+# --------------------------------------------------------------------------- #
+# Queries
+# --------------------------------------------------------------------------- #
 def _run_query(conn, query: str, params: dict | None = None):
     qr = conn.execute(query, params or {})
     return qr.get_as_pl()
 
 
 def find_functions(conn, pattern: str, languages: list[str] | None = None):
-    """
-    Return function/method definitions whose name matches ``pattern``.
-
-    The function name is the named child whose grammar field is ``name``;
-    we additionally fall back to any leaf ``identifier`` child so this is
-    robust across grammars.  ``pattern`` is a regex applied via Cypher ``=~``.
-    """
+    """Return semantic Function and Method nodes matching ``pattern``."""
     del languages  # reserved for future per-language filtering
-    cy = f"""
-    MATCH (fn)-[:CHILD]->(name:AstNode)
-    WHERE name.text =~ $pattern
-      AND fn.kind IN {_FUNCTION_KINDS!s}
-    RETURN name.text AS name_text,
-           fn.kind AS kind,
-           fn.start_row AS start_row,
-           fn.start_col AS start_col;
-    """
-    return _run_query(conn, cy, {"pattern": pattern})
+    frames = []
+    for label in ("Function", "Method"):
+        frames.append(
+            _run_query(
+                conn,
+                f"""
+                MATCH (fn:{label})
+                WHERE fn.name =~ $pattern
+                RETURN fn.name AS name,
+                       '{label}' AS kind,
+                       fn.filePath AS file_path,
+                       fn.startLine AS start_line,
+                       fn.endLine AS end_line
+                """,
+                {"pattern": pattern},
+            )
+        )
+    return pl.concat(frames, how="vertical")
 
 
 def find_callers(conn, func_name: str):
-    """
-    Return call sites of ``func_name``.
-
-    Matches a call whose directly-called expression is either:
-
-    * an ``identifier`` whose text equals ``func_name``  (e.g. ``foo()``), or
-    * an ``attribute`` whose name child equals ``func_name`` (e.g.
-      ``obj.method()`` or ``Cls.method()``).
-
-    Macro invocations (rust) are matched when the macro name equals
-    ``func_name``.
-    """
-    call_kinds = _CALL_KINDS
-    cy = """
-    MATCH (call:AstNode)-[:CHILD]->(callee)
-    WHERE call.kind IN """ + f"{call_kinds!s}" + """
-      AND (
-        callee.text = $func_name
-        OR (
-          callee.kind = 'attribute'
-          AND EXISTS {
-            MATCH (callee)-[:CHILD]->(an:AstNode)
-            WHERE an.text = $func_name
-          }
-        )
-      )
-    RETURN call.id AS call_id,
-           call.kind AS call_kind,
-           call.start_row AS start_row,
-           call.start_col AS start_col;
-    """
-    df = _run_query(conn, cy, {"func_name": func_name})
-    if df.height:
-        df = df.with_columns(
-            [pl.col("call_id").str.split("#").list.get(0).alias("file")]
-        )
-    return df
+    """Return semantic nodes with a CALLS edge to a named function or method."""
+    frames = []
+    for caller_label in ("File", "Function", "Method"):
+        for target_label in ("Function", "Method"):
+            frames.append(
+                _run_query(
+                    conn,
+                    f"""
+                    MATCH (caller:{caller_label})-[r:CodeRelation]->(
+                        target:{target_label}
+                    )
+                    WHERE r.type = 'CALLS' AND target.name = $func_name
+                    RETURN caller.name AS caller,
+                           '{caller_label}' AS caller_kind,
+                           caller.filePath AS file_path,
+                           target.name AS callee,
+                           r.confidence AS confidence,
+                           r.reason AS reason
+                    """,
+                    {"func_name": func_name},
+                )
+            )
+    return pl.concat(frames, how="vertical")
 
 
 # --------------------------------------------------------------------------- #
@@ -464,7 +513,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lscope",
         description=(
-            "Index source code ASTs into a ladybug DB and run code queries. "
+            "Index a semantic code graph into a Ladybug DB and run code queries. "
             "Exactly one of --index / --find-functions / --find-callers is "
             "required."
         ),
@@ -588,7 +637,7 @@ def run_index(args: argparse.Namespace) -> int:
     db, conn = _open_db(args.db)
     try:
         apply_schema(conn, _load_schema_text(args.schema))
-        total_nodes = 0
+        analyses = []
         per_lang: dict[str, int] = {}
         for i, path in enumerate(files, 1):
             lang = registry.language_for_path(path)
@@ -596,13 +645,21 @@ def run_index(args: argparse.Namespace) -> int:
             parser = registry.parser_for(lang)
             with open(path, "r", encoding="utf8") as fh:
                 source = fh.read()
-            n = ingest_file(conn, path, lang, source, parser)
-            total_nodes += n
+            analysis = analyze_file(path, lang, source, parser)
+            analyses.append(analysis)
             per_lang[lang] = per_lang.get(lang, 0) + 1
-            print(f"[{i}/{len(files)}] {lang}: {path} ({n} nodes)")
+            print(
+                f"[{i}/{len(files)}] {lang}: {path} "
+                f"({len(analysis['symbols'])} symbols)"
+            )
+
+        total_nodes = 0
+        for analysis in analyses:
+            total_nodes += ingest_analysis(conn, analysis)
+        call_count = ingest_calls(conn, analyses)
         print(
-            f"\nIngested {len(files)} file(s) / {total_nodes} AST node(s) "
-            f"into {args.db}"
+            f"\nIngested {len(files)} file(s), {total_nodes} semantic node(s), "
+            f"and {call_count} resolved call(s) into {args.db}"
         )
         for lang, count in sorted(per_lang.items()):
             print(f"  {lang}: {count} file(s)")
