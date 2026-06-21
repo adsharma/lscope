@@ -239,6 +239,7 @@ _REQUIRED_REL_CONNECTIONS = (
     ("Method", "Impl"),
     ("Class", "Struct"),
     ("Class", "Impl"),
+    ("Class", "Function"),
     ("Interface", "Class"),
     ("Interface", "Struct"),
     ("Interface", "Trait"),
