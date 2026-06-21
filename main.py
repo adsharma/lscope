@@ -454,7 +454,6 @@ def analyze_file(path: str, language: str, source: str, parser: Parser) -> dict:
             "name": os.path.basename(path),
             "path": path,
             "language": language,
-            "source": source,
         },
         "symbols": symbols,
         "calls": calls,
@@ -497,7 +496,7 @@ def ingest_analysis(conn, analysis: dict) -> int:
     file = analysis["file"]
     conn.execute(
         "MERGE (f:File {id: $id}) SET f.name = $name, f.path = $path, "
-        "f.filePath = $path, f.language = $language, f.source = $source",
+        "f.filePath = $path, f.language = $language",
         file,
     )
     file_ref = {"id": file["id"], "label": "File"}

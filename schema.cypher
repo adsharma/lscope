@@ -17,7 +17,6 @@ CREATE NODE TABLE File (
     path        STRING,
     filePath    STRING,
     language    STRING,
-    source      STRING,
     PRIMARY KEY (id)
 );
 

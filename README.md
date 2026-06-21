@@ -12,7 +12,7 @@ Ingested 9 file(s), 90 semantic node(s), and 149 resolved call(s) into test.db u
   python: 9 file(s)
 
 $ du -sh test.db
-1.0M    test.db
+832K    test.db
 ```
 
 `--workers` controls parallel file reading and tree-sitter analysis. It defaults
