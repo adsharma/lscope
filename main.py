@@ -225,6 +225,33 @@ def _walk_dir(
 # Schema / DB helpers
 # --------------------------------------------------------------------------- #
 _REQUIRED_SCHEMA_TABLES = {"File", "Function", "Method", "Class", "CodeRelation"}
+_REQUIRED_REL_CONNECTIONS = (
+    ("Function", "Class"),
+    ("Function", "Interface"),
+    ("Function", "Struct"),
+    ("Function", "Trait"),
+    ("Function", "Impl"),
+    ("Method", "Class"),
+    ("Method", "Interface"),
+    ("Method", "Struct"),
+    ("Method", "Trait"),
+    ("Method", "Impl"),
+    ("Class", "Struct"),
+    ("Class", "Impl"),
+    ("Interface", "Class"),
+    ("Interface", "Struct"),
+    ("Interface", "Trait"),
+    ("Interface", "Impl"),
+    ("Struct", "Class"),
+    ("Struct", "Struct"),
+    ("Struct", "Impl"),
+    ("Trait", "Class"),
+    ("Trait", "Struct"),
+    ("Trait", "Interface"),
+    ("Trait", "Impl"),
+    ("Impl", "Interface"),
+    ("Impl", "Impl"),
+)
 
 
 def _default_schema_path() -> str:
@@ -265,6 +292,12 @@ def ensure_schema(conn, schema_path: str | None = None) -> None:
     tables = conn.execute("CALL show_tables() RETURN name").get_as_pl()
     existing = set(tables["name"].to_list()) if tables.height else set()
     if _REQUIRED_SCHEMA_TABLES <= existing:
+        for source, target in _REQUIRED_REL_CONNECTIONS:
+            if source in existing and target in existing:
+                conn.execute(
+                    "ALTER TABLE CodeRelation ADD IF NOT EXISTS "
+                    f"FROM {source} TO {target}"
+                )
         return
     if existing:
         missing = ", ".join(sorted(_REQUIRED_SCHEMA_TABLES - existing))
