@@ -17,12 +17,15 @@ non-sensical flag combinations are rejected up-front with a clear message.
 import argparse
 import os
 import sys
+import tempfile
 import threading
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 import ladybug
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tree_sitter import Language, Parser
 
 
@@ -515,9 +518,10 @@ def _ingest_relations(
 
     ``edges`` yields ``(source, target, rel_type, confidence, reason, step)``
     tuples where ``source`` / ``target`` are symbol dicts carrying ``id`` and
-    ``label``.  Edges are grouped by ``(source.label, target.label)`` so each
-    pair becomes a single ``UNWIND`` + ``MATCH`` + ``CREATE`` instead of one
-    query per edge.
+    ``label``.  Edges are grouped by ``(source.label, target.label)`` and each
+    group is bulk-loaded via ``COPY FROM`` (Arrow Parquet), which is
+    significantly faster than repeated ``UNWIND`` + ``MATCH`` + ``CREATE``
+    queries.
     """
     by_pair: dict[tuple[str, str], list[dict]] = {}
     for source, target, rel_type, confidence, reason, step in edges:
@@ -532,16 +536,29 @@ def _ingest_relations(
                 "step": step,
             }
         )
-    for (src_label, dst_label), rows in by_pair.items():
-        conn.execute(
-            f"UNWIND $rows AS row "
-            f"MATCH (a:{src_label} {{id: row.src}}), "
-            f"(b:{dst_label} {{id: row.dst}}) "
-            "CREATE (a)-[:CodeRelation {type: row.type, "
-            "confidence: row.confidence, reason: row.reason, "
-            "step: row.step}]->(b)",
-            {"rows": rows},
-        )
+    if not by_pair:
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for (src_label, dst_label), rows in by_pair.items():
+            path = os.path.join(tmpdir, f"{src_label}_{dst_label}.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "from": [r["src"] for r in rows],
+                        "to": [r["dst"] for r in rows],
+                        "type": [r["type"] for r in rows],
+                        "confidence": [r["confidence"] for r in rows],
+                        "reason": [r["reason"] for r in rows],
+                        "step": [r["step"] for r in rows],
+                    }
+                ),
+                path,
+            )
+            conn.execute(
+                f"COPY CodeRelation FROM '{path}' "
+                f"(FROM='{src_label}', TO='{dst_label}')"
+            )
 
 
 def ingest_analysis(conn, analysis: dict) -> int:
