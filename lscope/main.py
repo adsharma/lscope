@@ -783,7 +783,7 @@ def find_functions(conn, pattern: str, languages: list[str] | None = None):
                 {"pattern": pattern},
             )
         )
-    return pl.concat(frames, how="vertical")
+    return pa.concat_tables(frames)
 
 
 def find_callers(conn, func_name: str):
@@ -809,7 +809,7 @@ def find_callers(conn, func_name: str):
                     {"func_name": func_name},
                 )
             )
-    return pl.concat(frames, how="vertical")
+    return pa.concat_tables(frames)
 
 
 # --------------------------------------------------------------------------- #
