@@ -1042,16 +1042,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     action = _resolve_actions(args)
 
-    if action == "index":
-        return run_index(args)
-    if action == "find-functions":
-        return run_find_functions(args)
-    if action == "find-callers":
-        return run_find_callers(args)
-    if action == "schema-only":
-        return run_schema_only(args)
-    parser.error(f"Unhandled action {action!r}")
-    return 2  # unreachable
+    try:
+        if action == "index":
+            return run_index(args)
+        if action == "find-functions":
+            return run_find_functions(args)
+        if action == "find-callers":
+            return run_find_callers(args)
+        if action == "schema-only":
+            return run_schema_only(args)
+        parser.error(f"Unhandled action {action!r}")
+        return 2  # unreachable
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
