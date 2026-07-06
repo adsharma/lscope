@@ -1,5 +1,5 @@
 CALL disable_default_hash_index=true;
-CALL debug_enable_multi_writes=false;
+CALL debug_enable_multi_writes=true;
 
 // Semantic code-graph schema.
 //
@@ -225,6 +225,7 @@ CREATE REL TABLE GROUP CodeRelation (
     FROM Class TO Struct,
     FROM Class TO Impl,
     FROM Class TO Method,
+    FROM Class TO Function,
     FROM Class TO Property,
     FROM Interface TO Class,
     FROM Interface TO Struct,

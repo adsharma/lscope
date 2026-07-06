@@ -961,7 +961,6 @@ def run_index(args: argparse.Namespace) -> int:
                 f"({len(analysis['symbols'])} symbols)"
             )
 
-        print("analysis starting")
         # Nodes: parallelized across worker threads, each with its own
         # connection to the shared multi-write database.
         total_nodes, def_edges = ingest_analyses_parallel(
@@ -970,7 +969,6 @@ def run_index(args: argparse.Namespace) -> int:
         # Definition edges (COPY CodeRelation = DDL) must run sequentially,
         # not concurrently with active write transactions from workers.
         _ingest_chunk_edges(conn, def_edges)
-        print("analysis done")
         # Calls need every node already written and a global name index, so they
         # stay single-threaded on the main connection.
         call_count = ingest_calls(conn, analyses)
@@ -982,9 +980,7 @@ def run_index(args: argparse.Namespace) -> int:
         for lang, count in sorted(per_lang.items()):
             print(f"  {lang}: {count} file(s)")
     finally:
-        print("executing finally")
         conn.close()
-        print("close done finally")
         db.close()
     return 0
 
