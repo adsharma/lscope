@@ -738,7 +738,12 @@ def ingest_analyses_parallel(
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="lscope-ingest"
     ) as executor:
-        for n, edges in executor.map(_run, chunks):
+        for n, edges in tqdm(
+            executor.map(_run, chunks),
+            total=len(chunks),
+            desc="Ingesting",
+            unit="chunk",
+        ):
             total += n
             all_edges.extend(edges)
     return total, all_edges
@@ -949,17 +954,20 @@ def run_index(args: argparse.Namespace) -> int:
             max_workers=worker_count,
             thread_name_prefix="lscope-analyze",
         ) as executor:
-            analyses = list(executor.map(analyze_path, files))
+            analyses = list(
+                tqdm(
+                    executor.map(analyze_path, files),
+                    total=len(files),
+                    desc="Analyzing",
+                    unit="file",
+                )
+            )
 
         per_lang: dict[str, int] = {}
         for i, analysis in enumerate(analyses, 1):
             path = analysis["file"]["path"]
             lang = analysis["file"]["language"]
             per_lang[lang] = per_lang.get(lang, 0) + 1
-            print(
-                f"[{i}/{len(files)}] {lang}: {path} "
-                f"({len(analysis['symbols'])} symbols)"
-            )
 
         # Nodes: parallelized across worker threads, each with its own
         # connection to the shared multi-write database.
