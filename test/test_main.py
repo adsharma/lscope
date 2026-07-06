@@ -40,8 +40,8 @@ def test_ingests_classes_nested_in_functions_and_methods(tmp_path):
             RETURN label(owner) AS owner_label, nested.name AS nested_name
             ORDER BY nested_name
             """
-        ).get_as_pl()
-        assert rows.to_dicts() == [
+        ).get_as_arrow()
+        assert [dict(zip(rows.column_names, row)) for row in zip(*(rows.column(c).to_pylist() for c in rows.column_names))] == [
             {"owner_label": "Function", "nested_name": "Inner"},
             {"owner_label": "Method", "nested_name": "Local"},
         ]
