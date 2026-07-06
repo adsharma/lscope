@@ -826,9 +826,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s 0.1.2",
+        help="Show the version and exit",
+    )
+    p.add_argument(
         "--db",
         "-d",
-        default="test.db",
+        default=".lscope.lbdb",
         help="Ladybug database file (default: %(default)s)",
     )
     p.add_argument(
