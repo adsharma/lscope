@@ -656,7 +656,7 @@ def _ingest_chunk_nodes(
             "UNWIND $rows AS row "
             "MERGE (f:File {id: row.id}) "
             "SET f.name = row.name, f.path = row.path, "
-            "f.filePath = row.filePath, f.language = row.language",
+            "f.filePath = row.path, f.language = row.language",
             {"rows": all_files},
         )
     for label, rows in all_by_label.items():
