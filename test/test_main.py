@@ -1,6 +1,12 @@
 import ladybug
 
-from main import LanguageRegistry, analyze_file, ensure_schema, ingest_analysis
+from lscope.main import (
+    LanguageRegistry,
+    _ingest_chunk_edges,
+    analyze_file,
+    ensure_schema,
+    ingest_analyses_parallel,
+)
 
 
 NESTED_TYPES = """\
@@ -32,7 +38,9 @@ def test_ingests_classes_nested_in_functions_and_methods(tmp_path):
         ensure_schema(conn)
         analysis = _analyze_nested_types()
 
-        assert ingest_analysis(conn, analysis) == 6
+        total_nodes, def_edges = ingest_analyses_parallel(db, [analysis], 1)
+        _ingest_chunk_edges(conn, def_edges)
+        assert total_nodes == 6
         rows = conn.execute(
             """
             MATCH (owner)-[r:CodeRelation]->(nested:Class)
@@ -62,7 +70,11 @@ def test_ensure_schema_migrates_existing_relation_group(tmp_path):
 
         ensure_schema(conn)
 
-        assert ingest_analysis(conn, _analyze_nested_types()) == 6
+        total_nodes, def_edges = ingest_analyses_parallel(
+            db, [_analyze_nested_types()], 1
+        )
+        _ingest_chunk_edges(conn, def_edges)
+        assert total_nodes == 6
     finally:
         conn.close()
         db.close()
