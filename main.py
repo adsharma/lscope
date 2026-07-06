@@ -676,29 +676,38 @@ def _ingest_chunk_nodes(
 
 def ingest_analyses_parallel(
     db, analyses: list[dict], workers: int
-) -> int:
+) -> tuple[
+    int,
+    list[tuple[dict, dict, str, float, str, int]],
+]:
     """
-    Ingest nodes + DEFINES/HAS_METHOD edges for many files in parallel.
+    Ingest nodes for many files in parallel.
 
     Each worker thread owns its own ``Connection`` to the shared ``Database``
     (opened with ``enable_multi_writes=True`` so concurrent write transactions
     are permitted).  Analyses are split round-robin into ``workers`` chunks so
-    per-file node/edge batches stay independent and need no cross-thread
-    coordination.  Returns the total number of nodes written.
+    per-file node batches stay independent and need no cross-thread
+    coordination.
+
+    Returns ``(node_count, all_definition_edges)``.  The caller must
+    insert the returned edges **sequentially** after all workers finish
+    (``COPY CodeRelation`` is a DDL operation that cannot run concurrently
+    with active write transactions from other threads).
     """
     if not analyses:
-        return 0
+        return 0, []
     workers = max(1, min(workers, len(analyses)))
     total = 0
+    all_edges: list[tuple[dict, dict, str, float, str, int]] = []
 
-    def _run(chunk: list[dict]) -> int:
+    def _run(chunk: list[dict]) -> tuple[int, list]:
         """Collect node data from every file in *chunk*, bulk-insert
-        all nodes, then bulk-insert all definition edges."""
+        all nodes, return (count, edges) for deferred insertion."""
         conn = ladybug.Connection(db)
         try:
             all_files: list[dict] = []
             all_by_label: dict[str, list[dict]] = {}
-            all_edges: list[
+            chunk_edges: list[
                 tuple[dict, dict, str, float, str, int]
             ] = []
             chunk_total = 0
@@ -706,12 +715,11 @@ def ingest_analyses_parallel(
                 file_ref, by_label, n, edges = _collect_file_data(a)
                 all_files.append(file_ref)
                 chunk_total += n
-                all_edges.extend(edges)
+                chunk_edges.extend(edges)
                 for label, rows in by_label.items():
                     all_by_label.setdefault(label, []).extend(rows)
             _ingest_chunk_nodes(conn, all_files, all_by_label)
-            _ingest_chunk_edges(conn, all_edges)
-            return chunk_total
+            return chunk_total, chunk_edges
         finally:
             conn.close()
 
@@ -721,15 +729,19 @@ def ingest_analyses_parallel(
 
     if workers == 1:
         for c in tqdm(chunks, desc="Ingesting", unit="chunk"):
-            total += _run(c)
-        return total
+            n, edges = _run(c)
+            total += n
+            all_edges.extend(edges)
+        # Single-threaded — safe to insert edges right away
+        return total, all_edges
 
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="lscope-ingest"
     ) as executor:
-        for n in executor.map(_run, chunks):
+        for n, edges in executor.map(_run, chunks):
             total += n
-    return total
+            all_edges.extend(edges)
+    return total, all_edges
 
 
 # --------------------------------------------------------------------------- #
@@ -950,9 +962,14 @@ def run_index(args: argparse.Namespace) -> int:
             )
 
         print("analysis starting")
-        # Nodes + DEFINES/HAS_METHOD edges: parallelized across worker threads,
-        # each with its own connection to the shared multi-write database.
-        total_nodes = ingest_analyses_parallel(db, analyses, worker_count)
+        # Nodes: parallelized across worker threads, each with its own
+        # connection to the shared multi-write database.
+        total_nodes, def_edges = ingest_analyses_parallel(
+            db, analyses, worker_count
+        )
+        # Definition edges (COPY CodeRelation = DDL) must run sequentially,
+        # not concurrently with active write transactions from workers.
+        _ingest_chunk_edges(conn, def_edges)
         print("analysis done")
         # Calls need every node already written and a global name index, so they
         # stay single-threaded on the main connection.
