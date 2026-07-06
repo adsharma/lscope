@@ -509,64 +509,15 @@ def analyze_path(path: str) -> dict:
     return analyze_file(path, language, source, registry.parser_for(language))
 
 
-def _ingest_relations(
-    conn,
-    edges: Iterable[tuple[dict, dict, str, float, str, int]],
-) -> None:
+def _ingest_nodes(
+    conn, analysis: dict
+) -> tuple[int, list[tuple[dict, dict, str, float, str, int]]]:
     """
-    Create CodeRelation edges in bulk.
+    Write one analyzed file's nodes (File + semantic symbols).
 
-    ``edges`` yields ``(source, target, rel_type, confidence, reason, step)``
-    tuples where ``source`` / ``target`` are symbol dicts carrying ``id`` and
-    ``label``.  Edges are grouped by ``(source.label, target.label)`` and each
-    group is bulk-loaded via ``COPY FROM`` (Arrow Parquet), which is
-    significantly faster than repeated ``UNWIND`` + ``MATCH`` + ``CREATE``
-    queries.
-    """
-    by_pair: dict[tuple[str, str], list[dict]] = {}
-    for source, target, rel_type, confidence, reason, step in edges:
-        key = (source["label"], target["label"])
-        by_pair.setdefault(key, []).append(
-            {
-                "src": source["id"],
-                "dst": target["id"],
-                "type": rel_type,
-                "confidence": confidence,
-                "reason": reason,
-                "step": step,
-            }
-        )
-    if not by_pair:
-        return
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for (src_label, dst_label), rows in by_pair.items():
-            path = os.path.join(tmpdir, f"{src_label}_{dst_label}.parquet")
-            pq.write_table(
-                pa.table(
-                    {
-                        "from": [r["src"] for r in rows],
-                        "to": [r["dst"] for r in rows],
-                        "type": [r["type"] for r in rows],
-                        "confidence": [r["confidence"] for r in rows],
-                        "reason": [r["reason"] for r in rows],
-                        "step": [r["step"] for r in rows],
-                    }
-                ),
-                path,
-            )
-            conn.execute(
-                f"COPY CodeRelation FROM '{path}' "
-                f"(FROM='{src_label}', TO='{dst_label}')"
-            )
-
-
-def ingest_analysis(conn, analysis: dict) -> int:
-    """Write one analyzed file's nodes and definition relationships.
-
-    Nodes are upserted in one ``UNWIND`` per label (the SET clause is shared by
-    every semantic label) and the File→/DEFINES/HAS_METHOD edges are written in
-    a single bulk pass, collapsing ~2N+1 round-trips down to a handful.
+    Returns ``(node_count, edges)`` where ``edges`` is the list of
+    DEFINES / HAS_METHOD / … relationship tuples that should be
+    inserted together with other files' edges in a single bulk pass.
     """
     file = analysis["file"]
     conn.execute("BEGIN TRANSACTION")
@@ -577,7 +528,6 @@ def ingest_analysis(conn, analysis: dict) -> int:
     )
     file_ref = {"id": file["id"], "label": "File"}
 
-    # Group symbols by label so each distinct label is one UNWIND statement.
     by_label: dict[str, list[dict]] = {}
     for symbol in analysis["symbols"]:
         by_label.setdefault(symbol["label"], []).append(
@@ -601,30 +551,26 @@ def ingest_analysis(conn, analysis: dict) -> int:
             {"rows": rows},
         )
 
-    print(f"ingesting symbols: {len(analysis['symbols'])}")
-    _ingest_relations(
-        conn,
+    edges: list[tuple[dict, dict, str, float, str, int]] = [
         (
-            (
-                symbol.get("owner") or file_ref,
-                symbol,
-                symbol["relation"],
-                1.0,
-                "",
-                0,
-            )
-            for symbol in analysis["symbols"]
-        ),
-    )
+            symbol.get("owner") or file_ref,
+            symbol,
+            symbol["relation"],
+            1.0,
+            "",
+            0,
+        )
+        for symbol in analysis["symbols"]
+    ]
     conn.execute("COMMIT")
-    return 1 + len(analysis["symbols"])
+    return 1 + len(analysis["symbols"]), edges
 
 
 def ingest_calls(conn, analyses: list[dict]) -> int:
     """Resolve calls by name, preferring a declaration in the same file.
 
     Resolution stays a single global pass; only the writes are batched into one
-    ``CREATE`` per ``(caller_label, target_label)`` pair via ``_ingest_relations``.
+    ``CREATE`` per ``(caller_label, target_label)`` pair via ``_ingest_chunk_edges``.
     """
     by_name: dict[str, list[dict]] = {}
     for analysis in analyses:
@@ -652,8 +598,58 @@ def ingest_calls(conn, analyses: list[dict]) -> int:
                     0,
                 )
             )
-    _ingest_relations(conn, edges)
+    _ingest_chunk_edges(conn, edges)
     return len(edges)
+
+
+def _ingest_chunk_edges(
+    conn,
+    all_edges: list[tuple[dict, dict, str, float, str, int]],
+) -> None:
+    """Bulk-insert all edges collected from a chunk of files.
+
+    Edges are grouped by ``(source.label, target.label)``; each group
+    is written to a single temporary Parquet file and loaded with
+    ``COPY FROM`` — one bulk operation per label pair for the
+    entire chunk instead of one per file.
+    """
+    if not all_edges:
+        return
+
+    by_pair: dict[tuple[str, str], list[dict]] = {}
+    for source, target, rel_type, confidence, reason, step in all_edges:
+        key = (source["label"], target["label"])
+        by_pair.setdefault(key, []).append(
+            {
+                "src": source["id"],
+                "dst": target["id"],
+                "type": rel_type,
+                "confidence": confidence,
+                "reason": reason,
+                "step": step,
+            }
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for (src_label, dst_label), rows in by_pair.items():
+            path = os.path.join(tmpdir, f"{src_label}_{dst_label}.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "from": [r["src"] for r in rows],
+                        "to": [r["dst"] for r in rows],
+                        "type": [r["type"] for r in rows],
+                        "confidence": [r["confidence"] for r in rows],
+                        "reason": [r["reason"] for r in rows],
+                        "step": [r["step"] for r in rows],
+                    }
+                ),
+                path,
+            )
+            conn.execute(
+                f"COPY CodeRelation FROM '{path}' "
+                f"(FROM='{src_label}', TO='{dst_label}')"
+            )
 
 
 def ingest_analyses_parallel(
@@ -674,9 +670,21 @@ def ingest_analyses_parallel(
     total = 0
 
     def _run(chunk: list[dict]) -> int:
+        """Insert nodes for every file in *chunk*, then bulk-insert all
+        definition edges for the whole chunk in one pass per label pair."""
         conn = ladybug.Connection(db)
         try:
-            return sum(ingest_analysis(conn, a) for a in chunk)
+            chunk_total = 0
+            all_edges: list[
+                tuple[dict, dict, str, float, str, int]
+            ] = []
+            for a in chunk:
+                n, edges = _ingest_nodes(conn, a)
+                print(f"ingesting symbols: {len(a['symbols'])}")
+                chunk_total += n
+                all_edges.extend(edges)
+            _ingest_chunk_edges(conn, all_edges)
+            return chunk_total
         finally:
             conn.close()
 
