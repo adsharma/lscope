@@ -17,15 +17,14 @@ non-sensical flag combinations are rejected up-front with a clear message.
 import argparse
 import os
 import sys
-import tempfile
 import threading
+import uuid
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 import ladybug
 import pyarrow as pa
-import pyarrow.parquet as pq
 from tree_sitter import Language, Parser
 
 
@@ -596,9 +595,9 @@ def _ingest_chunk_edges(
     """Bulk-insert all edges collected from a chunk of files.
 
     Edges are grouped by ``(source.label, target.label)``; each group
-    is written to a single temporary Parquet file and loaded with
+    is registered as a temporary Arrow memory table and loaded with
     ``COPY FROM`` — one bulk operation per label pair for the
-    entire chunk instead of one per file.
+    entire chunk instead of one per file, and without writing to disk.
     """
     if not all_edges:
         return
@@ -617,26 +616,27 @@ def _ingest_chunk_edges(
             }
         )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for (src_label, dst_label), rows in by_pair.items():
-            path = os.path.join(tmpdir, f"{src_label}_{dst_label}.parquet")
-            pq.write_table(
-                pa.table(
-                    {
-                        "from": [r["src"] for r in rows],
-                        "to": [r["dst"] for r in rows],
-                        "type": [r["type"] for r in rows],
-                        "confidence": [r["confidence"] for r in rows],
-                        "reason": [r["reason"] for r in rows],
-                        "step": [r["step"] for r in rows],
-                    }
-                ),
-                path,
-            )
-            conn.execute(
-                f"COPY CodeRelation FROM '{path}' "
-                f"(FROM='{src_label}', TO='{dst_label}')"
-            )
+    for (src_label, dst_label), rows in by_pair.items():
+        table = pa.table(
+            {
+                "from": [r["src"] for r in rows],
+                "to": [r["dst"] for r in rows],
+                "type": [r["type"] for r in rows],
+                "confidence": [r["confidence"] for r in rows],
+                "reason": [r["reason"] for r in rows],
+                "step": [r["step"] for r in rows],
+            }
+        )
+        tmp_name = f"__lscope_{uuid.uuid4().hex}"
+        conn.create_arrow_table(tmp_name, table)
+        conn.execute(
+            f"COPY CodeRelation FROM ("
+            f"MATCH (s:{tmp_name}) "
+            f"RETURN s.from, s.to, s.type, s.confidence, s.reason, s.step"
+            f") "
+            f"(FROM='{src_label}', TO='{dst_label}')"
+        )
+        conn.drop_arrow_table(tmp_name)
 
 
 def _ingest_chunk_nodes(
