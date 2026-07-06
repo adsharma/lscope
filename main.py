@@ -20,9 +20,9 @@ import sys
 import threading
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 import ladybug
-import polars as pl
 from tree_sitter import Language, Parser
 
 
@@ -552,6 +552,7 @@ def ingest_analysis(conn, analysis: dict) -> int:
     a single bulk pass, collapsing ~2N+1 round-trips down to a handful.
     """
     file = analysis["file"]
+    conn.execute("BEGIN TRANSACTION")
     conn.execute(
         "MERGE (f:File {id: $id}) SET f.name = $name, f.path = $path, "
         "f.filePath = $path, f.language = $language",
@@ -583,6 +584,7 @@ def ingest_analysis(conn, analysis: dict) -> int:
             {"rows": rows},
         )
 
+    print(f"ingesting symbols: {len(analysis['symbols'])}")
     _ingest_relations(
         conn,
         (
@@ -597,6 +599,7 @@ def ingest_analysis(conn, analysis: dict) -> int:
             for symbol in analysis["symbols"]
         ),
     )
+    conn.execute("COMMIT")
     return 1 + len(analysis["symbols"])
 
 
@@ -663,6 +666,11 @@ def ingest_analyses_parallel(
     chunks: list[list[dict]] = [[] for _ in range(workers)]
     for i, analysis in enumerate(analyses):
         chunks[i % workers].append(analysis)
+
+    if workers == 1:
+        for c in tqdm(chunks, desc="Ingesting", unit="chunk"):
+            total += _run(c)
+        return total
 
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="lscope-ingest"
@@ -848,48 +856,6 @@ def _open_db(db_path: str, *, read_only: bool = False, multi_writes: bool = Fals
     return db, conn
 
 
-# How long to wait for the native database background thread to wind down before
-# giving up and letting the process exit anyway.  db.close() joins a libuv
-# event-loop thread that can, in rare shutdown races, never receive its stop
-# signal and park forever in kevent.  Running the close on a daemon thread with
-# a bounded join turns that hard hang into (at worst) a short delay plus a
-# warning, since daemon threads do not block interpreter shutdown.
-_DB_CLOSE_TIMEOUT = 10.0
-
-
-def _close_db(db, timeout: float = _DB_CLOSE_TIMEOUT) -> None:
-    """Close ``db`` without letting a stuck native join hang the caller.
-
-    ``ladybug.Database.close`` blocks on a background event-loop thread; under a
-    rare teardown race that join never completes.  We run the close on a daemon
-    thread and join with a bounded ``timeout``: if it finishes, great; if not,
-    the main thread proceeds and the daemon is torn down at process exit.
-    """
-    if db is None:
-        return
-    error: list[BaseException] = []
-
-    def _do_close():
-        try:
-            db.close()
-        except BaseException as exc:  # noqa: BLE001
-            error.append(exc)
-
-    worker = threading.Thread(
-        target=_do_close, name="lscope-db-close", daemon=True
-    )
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        print(
-            f"warning: database close did not finish within {timeout:g}s; "
-            "abandoning the background thread and exiting",
-            file=sys.stderr,
-        )
-    elif error:
-        raise error[0]
-
-
 def run_index(args: argparse.Namespace) -> int:
     targets = args.index_targets or ["."]
     registry = LanguageRegistry()
@@ -931,9 +897,11 @@ def run_index(args: argparse.Namespace) -> int:
                 f"({len(analysis['symbols'])} symbols)"
             )
 
+        print("analysis starting")
         # Nodes + DEFINES/HAS_METHOD edges: parallelized across worker threads,
         # each with its own connection to the shared multi-write database.
         total_nodes = ingest_analyses_parallel(db, analyses, worker_count)
+        print("analysis done")
         # Calls need every node already written and a global name index, so they
         # stay single-threaded on the main connection.
         call_count = ingest_calls(conn, analyses)
@@ -945,8 +913,10 @@ def run_index(args: argparse.Namespace) -> int:
         for lang, count in sorted(per_lang.items()):
             print(f"  {lang}: {count} file(s)")
     finally:
+        print("executing finally")
         conn.close()
-        _close_db(db)
+        print("close done finally")
+        db.close()
     return 0
 
 
@@ -958,7 +928,7 @@ def run_find_functions(args: argparse.Namespace) -> int:
         print(df)
     finally:
         conn.close()
-        _close_db(db)
+        db.close()
     return 0
 
 
@@ -970,7 +940,7 @@ def run_find_callers(args: argparse.Namespace) -> int:
         print(df)
     finally:
         conn.close()
-        _close_db(db)
+        db.close()
     return 0
 
 
@@ -984,7 +954,7 @@ def run_schema_only(args: argparse.Namespace) -> int:
         print(f"Applied schema from {args.schema} to {args.db}")
     finally:
         conn.close()
-        _close_db(db)
+        db.close()
     return 0
 
 
