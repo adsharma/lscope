@@ -509,23 +509,20 @@ def analyze_path(path: str) -> dict:
     return analyze_file(path, language, source, registry.parser_for(language))
 
 
-def _ingest_nodes(
-    conn, analysis: dict
-) -> tuple[int, list[tuple[dict, dict, str, float, str, int]]]:
+def _collect_file_data(
+    analysis: dict,
+) -> tuple[
+    dict,
+    dict[str, list[dict]],
+    int,
+    list[tuple[dict, dict, str, float, str, int]],
+]:
     """
-    Write one analyzed file's nodes (File + semantic symbols).
+    Extract node data and edges from one analysis without touching the DB.
 
-    Returns ``(node_count, edges)`` where ``edges`` is the list of
-    DEFINES / HAS_METHOD / … relationship tuples that should be
-    inserted together with other files' edges in a single bulk pass.
+    Returns ``(file_dict, symbols_by_label, node_count, edges)``.
     """
     file = analysis["file"]
-    conn.execute("BEGIN TRANSACTION")
-    conn.execute(
-        "MERGE (f:File {id: $id}) SET f.name = $name, f.path = $path, "
-        "f.filePath = $path, f.language = $language",
-        file,
-    )
     file_ref = {"id": file["id"], "label": "File"}
 
     by_label: dict[str, list[dict]] = {}
@@ -541,15 +538,6 @@ def _ingest_nodes(
                 "end_line": symbol["end_line"],
             }
         )
-    for label, rows in by_label.items():
-        conn.execute(
-            f"UNWIND $rows AS row "
-            f"MERGE (n:{label} {{id: row.id}}) "
-            "SET n.name = row.name, n.qualifiedName = row.qualified_name, "
-            "n.filePath = row.file_path, n.language = row.language, "
-            "n.startLine = row.start_line, n.endLine = row.end_line",
-            {"rows": rows},
-        )
 
     edges: list[tuple[dict, dict, str, float, str, int]] = [
         (
@@ -562,8 +550,7 @@ def _ingest_nodes(
         )
         for symbol in analysis["symbols"]
     ]
-    conn.execute("COMMIT")
-    return 1 + len(analysis["symbols"]), edges
+    return file, by_label, 1 + len(analysis["symbols"]), edges
 
 
 def ingest_calls(conn, analyses: list[dict]) -> int:
@@ -652,6 +639,41 @@ def _ingest_chunk_edges(
             )
 
 
+def _ingest_chunk_nodes(
+    conn,
+    all_files: list[dict],
+    all_by_label: dict[str, list[dict]],
+) -> None:
+    """Bulk-insert every node (files + symbols) for a whole chunk.
+
+    One ``UNWIND`` + ``MERGE`` per label across every file in the
+    chunk, wrapped in a single transaction — instead of one
+    transaction + one query per label **per file**.
+    """
+    conn.execute("BEGIN TRANSACTION")
+    if all_files:
+        conn.execute(
+            "UNWIND $rows AS row "
+            "MERGE (f:File {id: row.id}) "
+            "SET f.name = row.name, f.path = row.path, "
+            "f.filePath = row.filePath, f.language = row.language",
+            {"rows": all_files},
+        )
+    for label, rows in all_by_label.items():
+        conn.execute(
+            f"UNWIND $rows AS row "
+            f"MERGE (n:{label} {{id: row.id}}) "
+            "SET n.name = row.name, "
+            "n.qualifiedName = row.qualified_name, "
+            "n.filePath = row.file_path, "
+            "n.language = row.language, "
+            "n.startLine = row.start_line, "
+            "n.endLine = row.end_line",
+            {"rows": rows},
+        )
+    conn.execute("COMMIT")
+
+
 def ingest_analyses_parallel(
     db, analyses: list[dict], workers: int
 ) -> int:
@@ -670,19 +692,24 @@ def ingest_analyses_parallel(
     total = 0
 
     def _run(chunk: list[dict]) -> int:
-        """Insert nodes for every file in *chunk*, then bulk-insert all
-        definition edges for the whole chunk in one pass per label pair."""
+        """Collect node data from every file in *chunk*, bulk-insert
+        all nodes, then bulk-insert all definition edges."""
         conn = ladybug.Connection(db)
         try:
-            chunk_total = 0
+            all_files: list[dict] = []
+            all_by_label: dict[str, list[dict]] = {}
             all_edges: list[
                 tuple[dict, dict, str, float, str, int]
             ] = []
+            chunk_total = 0
             for a in chunk:
-                n, edges = _ingest_nodes(conn, a)
-                print(f"ingesting symbols: {len(a['symbols'])}")
+                file_ref, by_label, n, edges = _collect_file_data(a)
+                all_files.append(file_ref)
                 chunk_total += n
                 all_edges.extend(edges)
+                for label, rows in by_label.items():
+                    all_by_label.setdefault(label, []).extend(rows)
+            _ingest_chunk_nodes(conn, all_files, all_by_label)
             _ingest_chunk_edges(conn, all_edges)
             return chunk_total
         finally:
