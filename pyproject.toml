@@ -23,6 +23,12 @@ dependencies = [
     "tree-sitter-typescript>=0.23.2",
 ]
 
+[project.scripts]
+lscope = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
