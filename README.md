@@ -203,7 +203,7 @@ process.
 ### Indexing
 
 ```
-uv run python3 main.py --index [PATH ...] [--language LANG] [--workers N] [--db DB] [--schema SCHEMA]
+uvx lscope --index [PATH ...] [--language LANG] [--workers N] [--db DB] [--schema SCHEMA]
 ```
 
 - `PATH` — one or more files or directories (default: current directory).
@@ -215,7 +215,7 @@ uv run python3 main.py --index [PATH ...] [--language LANG] [--workers N] [--db 
 Example:
 
 ```
-$ uv run python3 main.py --index icebug-format --language python --workers 4
+$ uvx lscope --index icebug-format --language python --workers 4
 Created schema from .../lscope/schema.cypher
 Analyzing: 100%|████████████| 9/9 [00:00<00:00, 10.12 file/s]
 Ingesting: 100%|████████████| 4/4 [00:00<00:00,  8.54 chunk/s]
@@ -230,14 +230,14 @@ $ du -sh test.db
 ### Searching
 
 ```
-uv run python3 main.py --find-functions REGEX [--db DB]
-uv run python3 main.py --find-callers NAME [--db DB]
+uvx lscope --find-functions REGEX [--db DB]
+uvx lscope --find-callers NAME [--db DB]
 ```
 
 Example:
 
 ```
-$ uv run python3 main.py --find-functions 'main'
+$ uvx lscope --find-functions 'main'
 Functions matching /main/:
 shape: (4, 5)
 ┌──────┬──────────┬──────────────────────┬────────────┬──────────┐
@@ -249,7 +249,7 @@ shape: (4, 5)
 ```
 
 ```
-$ uv run python3 main.py --find-callers 'format_gb'
+$ uvx lscope --find-callers 'format_gb'
 Callers of 'format_gb':
 shape: (2, 6)
 ┌──────────────────────┬─────────────┬───────────┬───────────┬────────────┬──────────────────┐
@@ -263,7 +263,7 @@ shape: (2, 6)
 ### Schema only
 
 ```
-uv run python3 main.py --schema-only --schema SCHEMA --db DB
+uvx lscope --schema-only --schema SCHEMA --db DB
 ```
 
 Applies the schema file to the database without indexing any files.
